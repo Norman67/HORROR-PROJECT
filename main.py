@@ -43,6 +43,10 @@ from OpenGL.GL import (
     glMatrixMode,
 )
 from OpenGL.GLU import gluPerspective
+try:
+    from OpenGL.GL import glGetError
+except ImportError:  # pragma: no cover
+    glGetError = None
 
 from engine.camera import Camera
 from engine.lighting import LightingSystem
@@ -63,7 +67,7 @@ class AppConfig:
     mouse_smooth_rate: float = 30.0   # 1/с — догон позиции мыши
     material_specular: tuple = (0.35, 0.35, 0.35, 1.0)
     material_shininess: float = 24.0
-    clear_color: tuple = (0.0, 0.0, 0.0, 1.0)
+    clear_color: tuple = (0.05, 0.05, 0.07, 1.0)  # тёмно-серый «небо» вместо чистого чёрного
 
 
 class MouseLookSmoother:
@@ -112,7 +116,29 @@ def process_events(lighting: LightingSystem) -> bool:
             pygame.mouse.get_rel()  # сброс накопленной дельты
         elif event.key == pygame.K_f:
             lighting.toggle_flashlight()
+            # Если фонарик выключили, а мир без него не освещён — включаем
+            # мягкий дежурный свет, чтобы экран не становился полностью чёрным.
+            lighting.ensure_visible_without_flashlight()
     return True
+
+
+def _check_gl_error(frame_no: int):
+    """Однократная диагностика: если драйвер вернул ошибку GL — печатаем её.
+
+    glClear/glBegin-пары здесь нет, поэтому glGetError достаточно вызвать раз
+    за кадр (это дешёвый запрос состояния). При появлении ошибки выводим
+    подсказку — чаще всего это потеря VBO после смены контекста/сна Windows.
+    """
+    if glGetError is None:
+        return
+    err = glGetError()
+    if err != 0:
+        print(
+            f"[GL] ошибка 0x{err:04X} на кадре {frame_no}. "
+            "Если это произошло сразу после F (фонарик) или после выхода из "
+            "сна/сворачивания окна — вероятно, контекст OpenGL был пересоздан "
+            "и VBO больше не валидны."
+        )
 
 
 def run(config: AppConfig | None = None) -> None:
@@ -180,6 +206,9 @@ def run(config: AppConfig | None = None) -> None:
         glLoadIdentity()
 
         camera.apply()
+        # ВАЖНО: update_flashlight() должна вызываться ПОСЛЕ camera.apply(),
+        # т.к. glLightfv(GL_POSITION, ...) трансформируется текущей modelview —
+        # только так свет остаётся «в руке» камеры при любом её положении.
         lighting.update_flashlight(
             camera.eye_position,
             camera.get_flashlight_direction(),

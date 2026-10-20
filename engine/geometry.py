@@ -31,9 +31,12 @@ def build_floor(size: float, divisions: int) -> np.ndarray:
     c = np.stack([gx1.ravel(), np.zeros_like(gx1.ravel()), gz1.ravel()], -1)
     d = np.stack([gx0.ravel(), np.zeros_like(gx0.ravel()), gz1.ravel()], -1)
 
-    # Два треугольника на квад: (a,b,c) и (a,c,d) — CCW сверху (+Y)
+    # Два треугольника на квад. ВНИМАНИЕ про winding: в right-handed системе
+    # координат OpenGL обход a→b→c (как было раньше) даёт нормаль −Y и при
+    # GL_CULL_FACE+GL_CCW пол оказывался «задней гранью» — чёрный экран.
+    # Правильный CCW-обход сверху: (a, c, b) и (a, d, c).
     tris = np.concatenate(
-        (np.stack([a, b, c], 1), np.stack([a, c, d], 1)), axis=0
+        (np.stack([a, c, b], 1), np.stack([a, d, c], 1)), axis=0
     ).reshape(-1, 3)  # (3*verts, 3)
 
     normals = np.tile(np.array([0.0, 1.0, 0.0], np.float32), (len(tris), 1))

@@ -123,13 +123,19 @@ class LightingSystem:
         self._lagged = np.empty(3, dtype=np.float64)
         self._dir_buf = np.empty(3, dtype=np.float64)
         self._up_buf = np.empty(3, dtype=np.float64)
-        self._pos_buf = np.zeros(4, dtype=np.float32)  # w=1, передаётся в GL
+        self._pos_buf = np.zeros(4, dtype=np.float32)  # w=0, eye-point
         self._diffuse_buf = np.empty(4, dtype=np.float32)
         self._diffuse_buf[3] = 1.0
+        # Направление прожектора: мировое -> eye-space
+        self._spot_world = np.empty(3, dtype=np.float64)
+        self._spot_eye = np.empty(3, dtype=np.float64)
+        self._basis_mat = np.empty(9, dtype=np.float64)
 
         # Кэш последнего отправленного в GL состояния фонарика:
         # {(pname): значение} — пропускаем redundant glLightfv
         self._gl_cache = {}
+        # Кэш GL_LIGHT_MODEL_AMBIENT: не пересылаем одно и то же в драйвер.
+        self._last_model_ambient = None
         self._setup_done = False
 
     # ------------------------------------------------------------------ #
@@ -142,7 +148,7 @@ class LightingSystem:
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, 1)
-        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (0.0, 0.0, 0.0, 1.0))
+        self._set_model_ambient(cfg.light_ambient)
         glLightfv(GL_LIGHT0, GL_AMBIENT, cfg.light_ambient)
         glLightf(GL_LIGHT0, GL_CONSTANT_ATTENUATION, 1.0)
         glLightf(GL_LIGHT0, GL_LINEAR_ATTENUATION, cfg.linear_attenuation)
@@ -153,13 +159,42 @@ class LightingSystem:
         self._setup_done = True
 
     # ------------------------------------------------------------------ #
+    def _set_model_ambient(self, value):
+        """GL_LIGHT_MODEL_AMBIENT с дедупликацией пересылок."""
+        if self._last_model_ambient == tuple(value):
+            return
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, value)
+        self._last_model_ambient = tuple(value)
+
     def _set_light_vector(self, pname, value):
-        """glLightfv с дедупликацией: не шлём в драйвер неизменное значение."""
+        """glLightfv с дедупликацией: не шлём в драйвер неизменное значение.
+
+        ВНИМАНИЕ: glLightfv(GL_POSITION/GL_SPOT_DIRECTION) трансформируется
+        ТЕКУЩЕЙ modelview. Все значения фонарика задаются в eye-space, а
+        cache сбрасывается каждый кадр (см. update_flashlight), поэтому
+        пересылка всегда происходит при актуальной матрице камеры.
+        """
         cached = self._gl_cache.get(pname)
         if cached is not None and np.array_equal(cached, value):
             return
         glLightfv(GL_LIGHT0, pname, value)
-        self._gl_cache[pname] = value
+        self._gl_cache[pname] = value.copy()
+
+    @staticmethod
+    def _world_basis_to_eye(yaw_rad, pitch_rad, out):
+        """Строки view-базиса камеры (3×3) в плоский массив `out` (in-place).
+
+        Соответствует glRotatef(-pitch,X)·glRotatef(-yaw,Y) из camera.apply():
+        out = [ex_x, ey_x, ez_x,  ex_y, ey_y, ez_y,  ex_z, ey_z, ez_z],
+        где eye = Rᵀ · (world - eye_pos), R — повороты камеры.
+        """
+        cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+        cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
+        # forward (eye -Z axis expressed in world) = (-cp*sy? ) — вывод:
+        # view row0 (screen X) = (-sy, 0, cy); row1 (screen Y) = (-sp*cy? ...)
+        out[0] = -sy;   out[1] = 0.0;  out[2] = cy
+        out[3] = -sp * cy; out[4] = cp; out[5] = sp * sy
+        out[6] = -cp * cy; out[7] = -sp; out[8] = cp * sy
 
     @staticmethod
     def _perp_basis(direction, right_out, up_out):
@@ -237,10 +272,26 @@ class LightingSystem:
         return pos_lat, pos_vert, dir_lat, dir_vert
 
     # ------------------------------------------------------------------ #
-    def update_flashlight(self, camera_position, camera_target_direction, delta_time):
+    def update_flashlight(
+        self, camera_position, camera_target_direction, delta_time,
+        camera_yaw=None, camera_pitch=None, bob_roll=0.0,
+    ):
+        """Обновляет GL_LIGHT0 (прожектор «в руке» игрока).
+
+        camera_yaw/camera_pitch/bob_roll — актуальная ориентация камеры
+        (углы в градусах). Они нужны, чтобы задать направление прожектора
+        в eye-space: glLightfv(GL_SPOT_DIRECTION) трансформируется текущей
+        modelview, поэтому мировое «догоняющее» направление пересчитывается
+        в глаза камеры напрямую (без зависимости от того, вызвана ли уже
+        camera.apply()).
+        """
         cfg = self.config
 
-        # Фонарик выключен → гасим свет, состояние не трогаем
+        # Кэш глади невалиден между кадрами: пересылать векторы нужно при
+        # актуальной матрице модели-вида каждого кадра.
+        self._gl_cache.clear()
+
+        # Фонарик выключен → гасим свет, состояние тряски не трогаем
         if not self.is_on:
             self._set_light_vector(GL_AMBIENT, _BLACK)
             self._set_light_vector(GL_DIFFUSE, _BLACK)
@@ -257,7 +308,7 @@ class LightingSystem:
             camera_position, delta_time
         )
 
-        # 2) Запаздывание направления: фонарь «догоняет» взгляд
+        # 2) Запаздывание направления: фонарь «догоняет» взгляд (в мире)
         target = np.asarray(camera_target_direction, dtype=np.float64)
         if self._smooth_dir is None:
             self._smooth_dir = target.copy()
@@ -272,25 +323,45 @@ class LightingSystem:
             lagged /= norm
         self._smooth_dir = lagged.copy()
 
-        # 3) Базис от уже-запаздывающего направления
+        # 3) Мировой базис «руки» вокруг запаздывающего направления
         right = self._dir_buf
         up = self._up_buf
         self._perp_basis(lagged, right, up)
 
-        # Позиция света (w=1 — позиционный источник)
-        cam = camera_position
-        gp = self._pos_buf
-        gp[0] = cam[0] + right[0] * pos_lat + up[0] * pos_vert
-        gp[1] = cam[1] + right[1] * pos_lat + up[1] * pos_vert
-        gp[2] = cam[2] + right[2] * pos_lat + up[2] * pos_vert
-        self._set_light_vector(GL_POSITION, gp)
-
-        # Направление прожектора с джиттером
-        dd = lagged + right * dir_lat + up * dir_vert
+        # Смещённое мировое направление луча с джиттером
+        dd = self._spot_world
+        np.add(lagged + right * dir_lat, up * dir_vert, out=dd)
         dn = float(np.linalg.norm(dd))
         if dn > 1e-12:
             dd /= dn
-        self._set_light_vector(GL_SPOT_DIRECTION, dd)
+
+        # 4) Перевод мирового направления в eye-space камеры.
+        #    Если углы не переданы — луч точно по направлению взгляда.
+        if camera_yaw is None or camera_pitch is None:
+            se = self._spot_eye
+            np.copyto(se, dd)  # вызывающий уже передал направление в eye-space
+            spot_eye = se
+        else:
+            yaw_rad = math.radians(camera_yaw)
+            pitch_rad = math.radians(camera_pitch)
+            m = self._basis_mat
+            self._world_basis_to_eye(yaw_rad, pitch_rad, m)
+            ex = m[0] * dd[0] + m[1] * dd[1] + m[2] * dd[2]
+            ey = m[3] * dd[0] + m[4] * dd[1] + m[5] * dd[2]
+            ez = m[6] * dd[0] + m[7] * dd[1] + m[8] * dd[2]
+            ln = math.sqrt(ex * ex + ey * ey + ez * ez)
+            if ln < 1e-12:
+                spot_eye = np.array((0.0, 0.0, -1.0), dtype=np.float64)
+            else:
+                se = self._spot_eye
+                se[0], se[1], se[2] = ex / ln, ey / ln, ez / ln
+                spot_eye = se
+
+        # Позиция света — eye-point (w=0): источник всегда «у глаз»,
+        # направление задаётся уже в eye-space и не зависит от modelview.
+        gp = self._pos_buf  # [0, 0, 0, 0]
+        self._set_light_vector(GL_POSITION, gp)
+        self._set_light_vector(GL_SPOT_DIRECTION, spot_eye)
 
         # Диффузный/спекулярный цвет (одинаковые) — один буфер на оба
         color = cfg.flashlight_color
@@ -308,3 +379,16 @@ class LightingSystem:
     def toggle_flashlight(self):
         self.is_on = not self.is_on
         self._gl_cache.clear()  # следующее включение должно переслать цвета
+
+    def ensure_visible_without_flashlight(self):
+        """Мягкий дежурный ambient, чтобы при выключенном фонарике экран не был чёрным.
+
+        Без этого при выключении света сцена остаётся ровно с нулевым
+        освещением и становится полностью чёрной («пол пропал»). При
+        включённом фонарике ambient возвращается к обычному значению —
+        так сохраняется хоррор-атмосфера со световым пятном.
+        """
+        if self.is_on:
+            self._set_model_ambient(self.config.light_ambient)
+        else:
+            self._set_model_ambient((0.35, 0.33, 0.30, 1.0))

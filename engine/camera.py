@@ -205,7 +205,7 @@ class Camera:
         )
 
     def get_flashlight_direction(self):
-        """Направление фонарика: взгляд + bob + лёгкий наклон вниз."""
+        """Направление фонарика: взгляд + bob + лёгкий наклон вниз (в мире)."""
         cfg = self.config
         yaw_rad = math.radians(self.yaw + self.bob_yaw)
         pitch_rad = math.radians(
@@ -216,3 +216,11 @@ class Camera:
             (-math.sin(yaw_rad) * cp, math.sin(pitch_rad), -math.cos(yaw_rad) * cp),
             dtype=np.float64,
         )
+
+    def flashlight_eye_direction(self):
+        """То же направление, но уже в eye-space камеры: ровно (0, sinα, −cosα),
+        где α = flashlight_pitch_offset. Не зависит от position/yaw/pitch —
+        прожектор всегда светит «прямо перед глазами» с фиксированным наклоном.
+        """
+        alpha = math.radians(self.config.flashlight_pitch_offset)
+        return np.array((0.0, math.sin(alpha), -math.cos(alpha)), dtype=np.float64)

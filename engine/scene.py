@@ -66,6 +66,18 @@ class Scene:
         self._boxes_mesh: Mesh | None = None
 
     # ------------------------------------------------------------------ #
+    def collider_aabbs(self):
+        """((minx,miny,minz),(maxx,maxy,maxz)) для каждого куба — коллизии."""
+        result = []
+        for box in self.config.boxes:
+            cx, cy, cz = box.center
+            hw, hh, hd = (s * 0.5 for s in box.size)
+            result.append(
+                ((cx - hw, cy - hh, cz - hd), (cx + hw, cy + hh, cz + hd))
+            )
+        return result
+
+    # ------------------------------------------------------------------ #
     def build(self):
         """Загружает меши в VBO. Требует активного GL-контекста."""
         if self._floor_mesh is None:

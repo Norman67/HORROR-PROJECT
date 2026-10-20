@@ -153,6 +153,8 @@ def run(config: AppConfig | None = None) -> None:
     camera = Camera()
     lighting = LightingSystem()
     scene = Scene()
+    # Коллизии со стенами кубов: игрок не проходит сквозь них.
+    camera.set_colliders(scene.collider_aabbs())
     smoother = MouseLookSmoother(config.mouse_smooth_rate)
 
     glEnable(GL_DEPTH_TEST)
@@ -206,12 +208,13 @@ def run(config: AppConfig | None = None) -> None:
         glLoadIdentity()
 
         camera.apply()
-        # ВАЖНО: update_flashlight() должна вызываться ПОСЛЕ camera.apply(),
-        # т.к. glLightfv(GL_POSITION, ...) трансформируется текущей modelview —
-        # только так свет остаётся «в руке» камеры при любом её положении.
+        # ВАЖНО: update_flashlight() вызывается ПОСЛЕ camera.apply():
+        # glLightfv(GL_POSITION/GL_SPOT_DIRECTION) трансформируется текущей
+        # modelview, поэтому фонарик задаётся в eye-space камеры — луч бьёт
+        # ровно по направлению взгляда (конус ~35°), а не «освещает всё».
         lighting.update_flashlight(
             camera.eye_position,
-            camera.get_flashlight_direction(),
+            camera.flashlight_eye_direction(),
             delta_time,
         )
         scene.draw()

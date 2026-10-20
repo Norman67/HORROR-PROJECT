@@ -57,6 +57,11 @@ class CameraConfig:
     # Наклон фонарика вниз относительно взгляда (градусы)
     flashlight_pitch_offset: float = -8.0
 
+    # Коллизии / гравитация
+    player_radius: float = 0.35      # «цилиндр» игрока в XZ
+    player_height: float = 1.7       # рост (для проверки сверху на кубы)
+    gravity: float = 20.0            # м/с² — прыжок с куба быстро приземляет
+
 
 # Фазы синусоид head-bob/дыхания — считаются одним векторным вызовом numpy:
 # f = [sin(2p), sin(p), sin(2p+1), sin(bt), sin(.63bt+1.7), sin(.41bt), sin(.29bt+.5)]
@@ -76,6 +81,13 @@ class Camera:
 
         self.speed = cfg.walk_speed
 
+        # --- Коллизии / вертикальное движение ---
+        # Список AABB-препятствий (min_x, min_y, min_z, max_x, max_y, max_z),
+        # устанавливается из сцены через set_colliders().
+        self._colliders: list[tuple] = []
+        self.ground_y = cfg.eye_height   # высота «пола» под ногами (0 = земля)
+        self.vy = 0.0                    # вертикальная скорость (гравитация)
+
         # --- Состояние head-bob ---
         self.smooth_speed = 0.0
         self.bob_phase = 0.0
@@ -87,6 +99,77 @@ class Camera:
 
         # Scratch для векторизованного расчёта фаз (не аллоцируется за кадр)
         self._phase_vec = np.empty(7, dtype=np.float64)
+
+    # ------------------------------------------------------------------ #
+    def set_colliders(self, aabb_list):
+        """Принимает препятствия: итерируемый ((minx,miny,minz),(maxx,maxy,maxz))."""
+        self._colliders = [
+            (float(mn[0]), float(mn[1]), float(mn[2]),
+             float(mx[0]), float(mx[1]), float(mx[2]))
+            for mn, mx in aabb_list
+        ]
+
+    def _resolve_horizontal(self, x: float, z: float) -> tuple[float, float]:
+        """Выталкивает круг игрока (XZ) из AABB кубов.
+
+        Игрок НЕ проходит сквозь кубы: при пересечении он выталкивается
+       вдоль минимальной оси — скольжение вдоль стены сохраняется.
+        """
+        r = self.config.player_radius
+        for bx0, by0, bz0, bx1, by1, bz1 in self._colliders:
+            if by1 <= 0.05:          # препятствие ниже уровня ног — не стена
+                continue
+            feet_y = self.position[1] - self.config.player_height
+            if by0 >= feet_y + 1e-4:  # игрок стоит ВЫШЕ верха куба — можно идти
+                continue
+            # нет пересечения по XZ с учётом радиуса — пропускаем быстро
+            if x < bx0 - r or x > bx1 + r or z < bz0 - r or z > bz1 + r:
+                continue
+            # ближайшие границы (выталкивание по минимальному проникновению)
+            dx_min = x - (bx0 - r)   # вытолкнуть в -X
+            dx_max = (bx1 + r) - x   # вытолкнуть в +X
+            dz_min = z - (bz0 - r)
+            dz_max = (bz1 + r) - z
+            m = min(dx_min, dx_max, dz_min, dz_max)
+            if m == dx_min:
+                x = bx0 - r
+            elif m == dx_max:
+                x = bx1 + r
+            elif m == dz_min:
+                z = bz0 - r
+            else:
+                z = bz1 + r
+        return x, z
+
+    def _update_vertical(self, delta_time: float):
+        """Гравитация + опора на верх кубов/пол. position[1] — высота глаз."""
+        cfg = self.config
+        feet = self.position[1] - cfg.player_height
+
+        # Пол под ногами: максимум по всем AABB, над которыми мы находимся
+        ground_top = 0.0
+        r = 0.05  # узкая зона «заступа» — чтобы не спотыкаться о грани
+        for bx0, by0, bz0, bx1, by1, bz1 in self._colliders:
+            x, z = self.position[0], self.position[2]
+            if bx0 - r <= x <= bx1 + r and bz0 - r <= z <= bz1 + r:
+                if feet >= by1 - 0.35:  # мы сверху или чуть выше крышки
+                    ground_top = max(ground_top, by1)
+
+        target_eye = ground_top + cfg.player_height
+        if self.position[1] > target_eye + 1e-6:
+            # падаем
+            self.vy -= cfg.gravity * delta_time
+            self.position[1] += self.vy * delta_time
+            if self.position[1] <= target_eye:
+                self.position[1] = target_eye
+                self.vy = 0.0
+        else:
+            # стоим на опоре (или плавно поднимаемся при заходе на куб)
+            self.position[1] += (target_eye - self.position[1]) * min(
+                1.0, 12.0 * delta_time
+            )
+            self.vy = 0.0
+        self.ground_y = ground_top
 
     # ------------------------------------------------------------------ #
     def handle_input(self, keys, mouse_dx, mouse_dy, delta_time):
@@ -127,11 +210,18 @@ class Camera:
             move_speed = cfg.sprint_speed if shift_held else cfg.walk_speed
             self.speed = move_speed
             step = move_speed * delta_time / length
-            self.position[0] += move_x * step
-            self.position[2] += move_z * step
+            # Новое положение + разрешение коллизий со стенами кубов:
+            # сквозь препятствия игрок пройти не может, но скользит вдоль них.
+            nx = self.position[0] + move_x * step
+            nz = self.position[2] + move_z * step
+            self.position[0], self.position[2] = self._resolve_horizontal(nx, nz)
         else:
             self.speed = cfg.walk_speed
             move_speed = 0.0
+
+        # Гравитация / опора на верх кубов (можно запрыгнуть сверху — пологий
+        # подъём; при шаге с высоты — падение).
+        self._update_vertical(delta_time)
 
         self._update_bob(delta_time, is_moving, move_speed, sy, cy)
 

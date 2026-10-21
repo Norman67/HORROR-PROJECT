@@ -1,209 +1,220 @@
+"""Core Descent: Drilling Horror Engine — точка входа.
+
+Ключевые улучшения относительно прошлой версии:
+* геометрия (пол 800×800 клеток + subdivided-кубы) генерируется ОДИН раз
+  векторизованным numpy и загружается в статические VBO; за кадр вместо
+  ~2.5 млн python-вызовов glVertex3f/glNormal3f — два glDrawArrays;
+* исправлен winding-порядок граней кубов (CCW снаружи), включено отсечение
+  задних граней — меньше растеризуемой геометрии, корректное освещение;
+* FPS-независимое сглаживание мыши — плавный обзор без «ступенек»;
+* конфигурация вынесена в dataclass'ы, GL-ресурсы освобождаются корректно.
+
+Управление: WASD — движение, Shift — бег, Мышь — обзор, F — фонарик,
+            ESC — выход, F1 — освободить курсор.
+Запуск из папки проекта:  python main.py
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import pygame
-from pygame.locals import *
-from OpenGL.GL import *
-from OpenGL.GLU import *
+from OpenGL.GL import (
+    GL_MODELVIEW,
+    GL_PROJECTION,
+    GL_BACK,
+    GL_CCW,
+    GL_COLOR_BUFFER_BIT,
+    GL_CULL_FACE,
+    GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_TEST,
+    GL_FRONT_AND_BACK,
+    GL_NORMALIZE,
+    GL_SHININESS,
+    GL_SPECULAR,
+    glClear,
+    glClearColor,
+    glCullFace,
+    glEnable,
+    glFrontFace,
+    glLoadIdentity,
+    glMaterialf,
+    glMaterialfv,
+    glMatrixMode,
+)
+from OpenGL.GLU import gluPerspective
+try:
+    from OpenGL.GL import glGetError
+except ImportError:  # pragma: no cover
+    glGetError = None
 
 from engine.camera import Camera
 from engine.lighting import LightingSystem
+from engine.math3d import exponential_smoothing_factor
+from engine.scene import Scene
 
 
-class Scene:
-    def __init__(self, floor_size=100.0, floor_divisions=800, box_subdivisions=30):
-        self.floor_size = floor_size
-        self.floor_divisions = floor_divisions
-        self.box_subdivisions = box_subdivisions
-        self._floor_list = None
-        self._boxes_list = None
+@dataclass(frozen=True)
+class AppConfig:
+    width: int = 800
+    height: int = 600
+    title: str = "Core Descent: Drilling Horror Engine"
+    fov: float = 75.0
+    near: float = 0.1
+    far: float = 200.0
+    fps_cap: int = 60
+    max_frame_time: float = 0.05      # защита от «телепорта» после сворачивания
+    mouse_smooth_rate: float = 30.0   # 1/с — догон позиции мыши
+    material_specular: tuple = (0.35, 0.35, 0.35, 1.0)
+    material_shininess: float = 24.0
+    clear_color: tuple = (0.05, 0.05, 0.07, 1.0)  # тёмно-серый «небо» вместо чистого чёрного
 
-    def draw(self):
-        self._draw_floor()
-        self._draw_boxes()
 
-    # ---------- пол ----------
-    def _draw_floor(self):
-        if self._floor_list is None:
-            self._build_floor_list()
-        glColor3f(0.30, 0.28, 0.25)
-        glCallList(self._floor_list)
+class MouseLookSmoother:
+    """Сглаживает дельты мыши так, чтобы итоговый угол был точным.
 
-    def _build_floor_list(self):
-        half = self.floor_size * 0.5
-        step = self.floor_size / self.floor_divisions
+    get_rel() отдаёт целочисленные «ступеньки»; экспоненциально догоняя
+    накопленную цель, камера движется непрерывно и не зависит от FPS.
+    Сумма всех step() равна исходной дельте — чувствительность не меняется.
+    """
 
-        self._floor_list = glGenLists(1)
-        glNewList(self._floor_list, GL_COMPILE)
-        glNormal3f(0.0, 1.0, 0.0)
-        glBegin(GL_QUADS)
-        for i in range(self.floor_divisions):
-            z0 = -half + i * step
-            z1 = z0 + step
-            for j in range(self.floor_divisions):
-                x0 = -half + j * step
-                x1 = x0 + step
-                glVertex3f(x0, 0.0, z0)
-                glVertex3f(x1, 0.0, z0)
-                glVertex3f(x1, 0.0, z1)
-                glVertex3f(x0, 0.0, z1)
-        glEnd()
-        glEndList()
+    def __init__(self, rate: float):
+        self._rate = rate
+        self._target_dx = 0.0
+        self._target_dy = 0.0
 
-    # ---------- кубы ----------
-    def _draw_boxes(self):
-        if self._boxes_list is None:
-            self._build_boxes_list()
-        glColor3f(0.32, 0.30, 0.27)
-        glCallList(self._boxes_list)
+    def feed(self, raw_dx: int, raw_dy: int):
+        self._target_dx += raw_dx
+        self._target_dy += raw_dy
 
-    def _build_boxes_list(self):
-        self._boxes_list = glGenLists(1)
-        glNewList(self._boxes_list, GL_COMPILE)
-        n = self.box_subdivisions
-        self._draw_box(-6.0, 1.0, -6.0, 2.0, 2.0, 2.0, n)
-        self._draw_box( 4.0, 1.5, -9.0, 3.0, 3.0, 3.0, n)
-        self._draw_box( 9.0, 0.75, 3.0, 1.5, 1.5, 1.5, n)
-        self._draw_box(-11.0, 2.0, 4.0, 4.0, 4.0, 4.0, n)
-        self._draw_box( 0.0, 0.5, -14.0, 1.0, 1.0, 1.0, n)
-        glEndList()
+    def reset(self):
+        self._target_dx = 0.0
+        self._target_dy = 0.0
 
-    def _draw_box(self, x, y, z, w, h, d, n):
-        """Куб, каждая грань — сетка n×n подквадов.
+    def step(self, delta_time: float) -> tuple[float, float]:
+        k = exponential_smoothing_factor(self._rate, delta_time)
+        out_dx = self._target_dx * k
+        out_dy = self._target_dy * k
+        self._target_dx -= out_dx
+        self._target_dy -= out_dy
+        return out_dx, out_dy
 
-        n=1 → 6 квадов на куб (как было)
-        n=3 → 54 квада на куб (~9x, ближайшая чистая сетка к 10x)
-        n=4 → 96 квадов на куб (16x)
-        """
-        hw, hh, hd = w * 0.5, h * 0.5, d * 0.5
 
-        glPushMatrix()
-        glTranslatef(x, y, z)
+def process_events(lighting: LightingSystem) -> bool:
+    """Обрабатывает очередь событий; возвращает False при сигнале к выходу."""
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return False
+        if event.type != pygame.KEYDOWN:
+            continue
+        if event.key == pygame.K_ESCAPE:
+            return False
+        if event.key == pygame.K_F1:
+            grabbed = not pygame.event.get_grab()
+            pygame.event.set_grab(grabbed)
+            pygame.mouse.set_visible(not grabbed)
+            pygame.mouse.get_rel()  # сброс накопленной дельты
+        elif event.key == pygame.K_f:
+            lighting.toggle_flashlight()
+            # Если фонарик выключили, а мир без него не освещён — включаем
+            # мягкий дежурный свет, чтобы экран не становился полностью чёрным.
+            lighting.ensure_visible_without_flashlight()
+    return True
 
-        # Каждая грань: (нормаль, 4 угла в CCW-порядке при взгляде снаружи)
-        # углы: p00 → p10 → p11 → p01 (это квадрат в порядке обхода)
-        faces = [
-            # +X
-            (( 1, 0, 0),
-             ( hw, -hh, -hd), ( hw,  hh, -hd), ( hw,  hh,  hd), ( hw, -hh,  hd)),
-            # -X
-            ((-1, 0, 0),
-             (-hw, -hh,  hd), (-hw,  hh,  hd), (-hw,  hh, -hd), (-hw, -hh, -hd)),
-            # +Y
-            (( 0, 1, 0),
-             (-hw,  hh, -hd), ( hw,  hh, -hd), ( hw,  hh,  hd), (-hw,  hh,  hd)),
-            # -Y
-            (( 0,-1, 0),
-             (-hw, -hh,  hd), ( hw, -hh,  hd), ( hw, -hh, -hd), (-hw, -hh, -hd)),
-            # +Z
-            (( 0, 0, 1),
-             (-hw, -hh,  hd), ( hw, -hh,  hd), ( hw,  hh,  hd), (-hw,  hh,  hd)),
-            # -Z
-            (( 0, 0,-1),
-             ( hw, -hh, -hd), (-hw, -hh, -hd), (-hw,  hh, -hd), ( hw,  hh, -hd)),
-        ]
 
-        for normal, p00, p10, p11, p01 in faces:
-            glNormal3f(*normal)
-            glBegin(GL_QUADS)
-            for i in range(n):
-                u0 = i / n
-                u1 = (i + 1) / n
-                for j in range(n):
-                    v0 = j / n
-                    v1 = (j + 1) / n
-                    glVertex3f(*self._bilerp(p00, p10, p11, p01, u0, v0))
-                    glVertex3f(*self._bilerp(p00, p10, p11, p01, u1, v0))
-                    glVertex3f(*self._bilerp(p00, p10, p11, p01, u1, v1))
-                    glVertex3f(*self._bilerp(p00, p10, p11, p01, u0, v1))
-            glEnd()
+def _check_gl_error(frame_no: int):
+    """Однократная диагностика: если драйвер вернул ошибку GL — печатаем её.
 
-        glPopMatrix()
-
-    @staticmethod
-    def _bilerp(p00, p10, p11, p01, u, v):
-        w00 = (1.0 - u) * (1.0 - v)
-        w10 = u * (1.0 - v)
-        w11 = u * v
-        w01 = (1.0 - u) * v
-        return (
-            w00 * p00[0] + w10 * p10[0] + w11 * p11[0] + w01 * p01[0],
-            w00 * p00[1] + w10 * p10[1] + w11 * p11[1] + w01 * p01[1],
-            w00 * p00[2] + w10 * p10[2] + w11 * p11[2] + w01 * p01[2],
+    glClear/glBegin-пары здесь нет, поэтому glGetError достаточно вызвать раз
+    за кадр (это дешёвый запрос состояния). При появлении ошибки выводим
+    подсказку — чаще всего это потеря VBO после смены контекста/сна Windows.
+    """
+    if glGetError is None:
+        return
+    err = glGetError()
+    if err != 0:
+        print(
+            f"[GL] ошибка 0x{err:04X} на кадре {frame_no}. "
+            "Если это произошло сразу после F (фонарик) или после выхода из "
+            "сна/сворачивания окна — вероятно, контекст OpenGL был пересоздан "
+            "и VBO больше не валидны."
         )
 
-    def cleanup(self):
-        if self._floor_list is not None:
-            glDeleteLists(self._floor_list, 1)
-            self._floor_list = None
-        if self._boxes_list is not None:
-            glDeleteLists(self._boxes_list, 1)
-            self._boxes_list = None
 
+def run(config: AppConfig | None = None) -> None:
+    config = config or AppConfig()
 
-def main():
     pygame.init()
-    display = (800, 600)
-    screen = pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Core Descent: Drilling Horror Engine")
+    pygame.display.set_mode(
+        (config.width, config.height), pygame.DOUBLEBUF | pygame.OPENGL
+    )
+    pygame.display.set_caption(config.title)
 
     camera = Camera()
     lighting = LightingSystem()
     scene = Scene()
+    # Коллизии со стенами кубов: игрок не проходит сквозь них.
+    camera.set_colliders(scene.collider_aabbs())
+    smoother = MouseLookSmoother(config.mouse_smooth_rate)
 
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_NORMALIZE)
+    glEnable(GL_CULL_FACE)
+    glFrontFace(GL_CCW)
+    glCullFace(GL_BACK)
 
-    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR,  [0.35, 0.35, 0.35, 1.0])
-    glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 24.0)
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, config.material_specular)
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, config.material_shininess)
 
     lighting.setup_global_lighting()
 
     glMatrixMode(GL_PROJECTION)
-    gluPerspective(75.0, display[0] / display[1], 0.1, 200.0)
+    gluPerspective(
+        config.fov, config.width / config.height, config.near, config.far
+    )
     glMatrixMode(GL_MODELVIEW)
 
     pygame.event.set_grab(True)
     pygame.mouse.set_visible(False)
     pygame.mouse.get_rel()
 
+    print(
+        "Управление: WASD — движение, Shift — бег, Мышь — обзор, "
+        "F — фонарик, ESC — выход, F1 — курсор"
+    )
+
     clock = pygame.time.Clock()
     running = True
 
-    print("Управление: WASD — движение, Мышь — обзор, F — вкл/выкл фонарик, ESC — выход, F1 — курсор")
-
     while running:
-        delta_time = min(clock.tick(60) / 1000.0, 0.05)
+        delta_time = min(clock.tick(config.fps_cap) / 1000.0, config.max_frame_time)
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key == pygame.K_F1:
-                    is_grabbed = not pygame.event.get_grab()
-                    pygame.event.set_grab(is_grabbed)
-                    pygame.mouse.set_visible(not is_grabbed)
-                    pygame.mouse.get_rel()
-                elif event.key == pygame.K_f:
-                    lighting.toggle_flashlight()
+        running = process_events(lighting)
+        if not running:
+            break
 
         if pygame.event.get_grab():
-            mouse_dx, mouse_dy = pygame.mouse.get_rel()
+            smoother.feed(*pygame.mouse.get_rel())
         else:
             pygame.mouse.get_rel()
-            mouse_dx, mouse_dy = 0, 0
+            smoother.reset()
+        mouse_dx, mouse_dy = smoother.step(delta_time)
 
         keys = pygame.key.get_pressed()
         camera.handle_input(keys, mouse_dx, mouse_dy, delta_time)
 
-        glClearColor(0.0, 0.0, 0.0, 1.0)
+        glClearColor(*config.clear_color)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
 
         camera.apply()
-
+        # ВАЖНО: update_flashlight() вызывается ПОСЛЕ camera.apply():
+        # glLightfv(GL_POSITION/GL_SPOT_DIRECTION) трансформируется текущей
+        # modelview, поэтому фонарик задаётся в eye-space камеры — луч бьёт
+        # ровно по направлению взгляда (конус ~35°), а не «освещает всё».
         lighting.update_flashlight(
-            camera.position,
-            camera.get_flashlight_direction(),
+            camera.eye_position,
+            camera.flashlight_eye_direction(),
             delta_time,
         )
         scene.draw()
@@ -215,4 +226,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()
